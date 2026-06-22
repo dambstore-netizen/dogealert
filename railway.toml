@@ -1,0 +1,2 @@
+[deploy]
+startCommand = "python doge_pump_detector.py"
