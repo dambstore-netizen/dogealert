@@ -164,19 +164,29 @@ def analyze(candles):
           f"| score={score}/3", end="")
 
     now = time.time()
-    if score >= MIN_SCORE and aligned and (now - _last_alert) > COOLDOWN:
+    if score >= MIN_SCORE and (now - _last_alert) > COOLDOWN:
         emoji = "🟢" if move_dir == "UP" else "🔴"
+        if aligned:
+            header   = f"🚨 <b>DOGE — rompimento {emoji} {move_dir}</b>"
+            tag      = f"Regime: <b>{reg_dir}</b> ✅ a favor da tendência"
+            note     = ""
+            log_tail = " → ALERTA (a favor do regime)"
+        else:
+            header   = f"🚨 <b>DOGE — rompimento {emoji} {move_dir}</b>  ⚠️ CONTRA-TENDÊNCIA"
+            tag      = f"Regime: <b>{reg_dir}</b> ⚠️ contra a tendência"
+            note     = ("\n\n<i>Movimento contra o regime macro — pode ser o início "
+                        "de uma reversão ou uma armadilha. Confirma antes de agir.</i>")
+            log_tail = " → ALERTA (CONTRA-tendência)"
         msg = (
-            f"🚨 <b>DOGE — rompimento {emoji} {move_dir}</b>\n"
+            f"{header}\n"
             f"Preço: <b>${cur['c']:.5f}</b>\n"
-            f"Regime: <b>{reg_dir}</b> | Score: <b>{score}/3</b>\n\n"
+            f"{tag} | Score: <b>{score}/3</b>\n\n"
             + "\n".join(signals)
+            + note
         )
         send_telegram(msg)
         _last_alert = now
-        print(" → ALERTA ENVIADO")
-    elif score >= MIN_SCORE and not aligned:
-        print(f" → filtrado (movimento {move_dir} contra regime {reg_dir})")
+        print(log_tail)
     else:
         print("")
 
@@ -186,7 +196,7 @@ def analyze(candles):
 def main():
     print("=" * 55)
     print(f"DOGE Pump Detector v4 — {INSTRUMENT} @ {TIMEFRAME} (Crypto.com)")
-    print(f"Bidirecional + filtro de regime | alerta ≥ {MIN_SCORE}/3")
+    print(f"Bidirecional | regime como contexto | alerta ≥ {MIN_SCORE}/3")
     print("=" * 55)
 
     try:
@@ -195,7 +205,8 @@ def main():
             "🟢 <b>DOGE Pump Detector v4 iniciado</b>\n"
             f"{INSTRUMENT} @ {TIMEFRAME} — bidirecional, volume real por candle.\n"
             f"Regime atual: <b>{reg['dir']}</b>\n"
-            f"Alerta quando score ≥ {MIN_SCORE}/3 na direção do regime."
+            f"Alerta quando score ≥ {MIN_SCORE}/3 — nos dois sentidos.\n"
+            f"Movimentos contra o regime vêm marcados ⚠️ CONTRA-TENDÊNCIA."
         )
     except Exception as e:
         print(f"[ERRO arranque] {e}")
