@@ -1,188 +1,212 @@
+"""
+doge_pump_detector.py — v4 (bidirecional + filtro de regime)
+
+EVOLUÇÃO:
+  v2  CoinGecko total_volumes = volume 24h-rolling → sinais de volume mortos.
+  v3  Crypto.com candles reais (volume por candle), timeframe 5m.
+  v4  Bidirecional (UP/DOWN) + só dispara na direção do regime macro.
+
+PORQUÊ o regime:
+  Backtest de 12 laterais do DOGE: a direção do breakout segue a tendência
+  macro onde a lateralização acontece (consolidação em queda rompe para baixo,
+  em recuperação rompe para cima). A lateralização não prevê direção (50/50);
+  o regime prevê. Por isso confirmamos o lado e filtramos os movimentos
+  contra-regime.
+
+  Regime = preço diário vs EMA diária. Só alerta se a direção do rompimento
+  coincidir com o regime. Cache horário (o regime diário não muda em 5min).
+
+Fonte: Crypto.com public API (sem key). Corre continuamente no Railway.
+"""
+
 import os
 import time
 import requests
 from datetime import datetime, timezone
 
-# ── Config ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-CG_API_KEY       = os.environ.get("CG_API_KEY", "CG-WGmUADkaPBMcWcEsz3L8KBhc")
+# ─────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────
+API_BASE   = "https://api.crypto.com/exchange/v1"
+INSTRUMENT = os.environ.get("DOGE_INSTRUMENT", "DOGE_USD")
 
-CHECK_INTERVAL   = 300    # 5 minutos
-COOLDOWN_PERIOD  = 3600   # 1h entre alertas
+TIMEFRAME    = "5m"
+CANDLE_COUNT = 60
+CHECK_INTERVAL = 300      # 5 min
 
-# Lateralização (dados diários)
-LATERAL_BAND     = 0.03   # ±3% = lateral
-LATERAL_MIN_DAYS = 4      # mínimo de dias laterais para ativar o contexto
+# ── Sinais de rompimento (janela 5m) ──
+VOL_BASELINE      = 12     # 12 x 5m = 1h de média base
+VOL_SPIKE_VS_AVG  = 2.5    # candle atual ≥ 2.5x a média da última hora
+VOL_ACCEL         = 2.0    # candle atual ≥ 2.0x a candle anterior
+PRICE_LOOKBACK    = 3      # 3 candles = 15 min
+PRICE_MOVE_PCT    = 0.015  # |movimento| ≥ 1.5% em 15 min  (bidirecional)
 
-# Volume (dados horários)
-VOL_SPIKE_VS_AVG = 1.40   # volume hora atual >= 1.4x média das últimas 6h
-VOL_ACCEL        = 1.20   # volume hora atual >= 1.2x hora anterior
-PRICE_MOVE_1H    = 0.02   # preço subiu >= 2% na última hora
+# ── Filtro de regime (candles diárias) ──
+REGIME_TIMEFRAME = "1D"
+REGIME_COUNT     = 30
+REGIME_EMA       = 21      # EMA ~3 semanas
+REGIME_REFRESH   = 3600    # recalcula o regime no máx. 1x/hora
 
-alert_cooldown = 0
+MIN_SCORE = 2              # alerta quando score ≥ 2/3
+COOLDOWN  = 3600           # 1h entre alertas
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
-def send_telegram(msg: str):
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+_last_alert   = 0
+_regime_cache = {"ts": 0, "dir": None, "price": None, "ema": None}
+
+# ─────────────────────────────────────────────
+#  TELEGRAM
+# ─────────────────────────────────────────────
+def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TELEGRAM] {msg}")
+        print("[AVISO] TELEGRAM_TOKEN/CHAT_ID não definidos — só imprimo.")
+        print(text)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
-        r.raise_for_status()
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
     except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
+        print(f"[ERRO TELEGRAM] {e}")
 
-# ── CoinGecko ────────────────────────────────────────────────────────────────
-def get_data(days, interval):
-    url = "https://api.coingecko.com/api/v3/coins/dogecoin/market_chart"
-    params = {"vs_currency": "usd", "days": str(days), "interval": interval}
-    headers = {"x-cg-demo-api-key": CG_API_KEY, "User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=15)
+# ─────────────────────────────────────────────
+#  DADOS
+# ─────────────────────────────────────────────
+def get_candles(timeframe=TIMEFRAME, count=CANDLE_COUNT):
+    url = f"{API_BASE}/public/get-candlestick"
+    params = {"instrument_name": INSTRUMENT, "timeframe": timeframe, "count": count}
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    raw = r.json()
-    vols = {v[0]: v[1] for v in raw["total_volumes"]}
-    candles = []
-    for ts_ms, price in raw["prices"]:
-        candles.append({
-            "dt":    datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
-            "price": price,
-            "vol":   vols.get(ts_ms, 0)
-        })
+    data = r.json().get("result", {}).get("data", [])
+    candles = [{
+        "t": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]),
+        "l": float(c["l"]), "c": float(c["c"]), "v": float(c["v"]),
+    } for c in data]
+    candles.sort(key=lambda x: x["t"])
     return candles
 
-# ── Lateralização ─────────────────────────────────────────────────────────────
-def check_lateral(daily):
-    """Conta quantos dias consecutivos (a partir do mais recente para trás)
-    o preço ficou dentro de ±LATERAL_BAND em relação ao preço de hoje."""
-    if len(daily) < 2:
-        return 0, 0.0
+# ─────────────────────────────────────────────
+#  REGIME (preço diário vs EMA diária, com cache)
+# ─────────────────────────────────────────────
+def _ema(values, period):
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
-    ref_price    = daily[-1]["price"]
-    lateral_days = 0
+def get_regime():
+    global _regime_cache
+    now = time.time()
+    if _regime_cache["dir"] and (now - _regime_cache["ts"] < REGIME_REFRESH):
+        return _regime_cache
 
-    for d in reversed(daily[:-1]):
-        deviation = abs(d["price"] - ref_price) / ref_price
-        if deviation <= LATERAL_BAND:
-            lateral_days += 1
-        else:
-            break
+    daily = get_candles(REGIME_TIMEFRAME, REGIME_COUNT)
+    if len(daily) < REGIME_EMA:
+        # sem dados suficientes: não filtra (deixa passar ambos os lados)
+        _regime_cache = {"ts": now, "dir": "BOTH", "price": None, "ema": None}
+        return _regime_cache
 
-    band_high = ref_price * (1 + LATERAL_BAND)
-    band_low  = ref_price * (1 - LATERAL_BAND)
-    return lateral_days, ref_price
+    closes = [c["c"] for c in daily]
+    ema_val = _ema(closes, REGIME_EMA)
+    price   = closes[-1]
+    direction = "UP" if price > ema_val else "DOWN"
+    _regime_cache = {"ts": now, "dir": direction, "price": price, "ema": ema_val}
+    return _regime_cache
 
-# ── Volume / Momentum horário ─────────────────────────────────────────────────
-def check_volume(hourly):
-    if len(hourly) < 8:
-        return 0, []
+# ─────────────────────────────────────────────
+#  ANÁLISE
+# ─────────────────────────────────────────────
+def analyze(candles):
+    global _last_alert
 
-    now       = hourly[-1]
-    prev_hour = hourly[-2]
-    last_6h   = hourly[-7:-1]
+    need = VOL_BASELINE + PRICE_LOOKBACK + 2
+    if len(candles) < need:
+        print(f"[AVISO] só {len(candles)} candles, preciso de {need}.")
+        return
 
-    price_now       = now["price"]
-    price_1h        = prev_hour["price"]
-    vol_now         = now["vol"]
-    vol_prev        = prev_hour["vol"]
-    vol_avg6h       = sum(c["vol"] for c in last_6h) / len(last_6h)
+    closed   = candles[:-1]                        # ignora candle em formação
+    cur      = closed[-1]
+    prev     = closed[-2]
+    baseline = closed[-(VOL_BASELINE + 1):-1]
 
-    price_change_1h  = (price_now - price_1h) / price_1h
-    vol_ratio_vs_avg = vol_now / vol_avg6h if vol_avg6h > 0 else 0
-    vol_accel        = vol_now / vol_prev   if vol_prev > 0 else 0
+    vol_avg   = sum(c["v"] for c in baseline) / len(baseline)
+    vol_ratio = cur["v"] / vol_avg   if vol_avg   > 0 else 0.0
+    vol_accel = cur["v"] / prev["v"] if prev["v"] > 0 else 0.0
 
-    score   = 0
-    signals = []
+    price_then = closed[-(PRICE_LOOKBACK + 1)]["c"]
+    price_move = (cur["c"] - price_then) / price_then
+    move_dir   = "UP" if price_move >= 0 else "DOWN"
 
-    if price_change_1h >= PRICE_MOVE_1H:
+    score, signals = 0, []
+    if abs(price_move) >= PRICE_MOVE_PCT:
         score += 1
-        signals.append(f"📈 Preço +{price_change_1h*100:.1f}% na última hora")
-
-    if vol_ratio_vs_avg >= VOL_SPIKE_VS_AVG:
+        signals.append(f"📈 Preço {price_move*100:+.2f}% em {PRICE_LOOKBACK*5}min")
+    if vol_ratio >= VOL_SPIKE_VS_AVG:
         score += 1
-        signals.append(f"📊 Volume {vol_ratio_vs_avg:.1f}x vs média 6h")
-
+        signals.append(f"📊 Volume {vol_ratio:.1f}x vs média 1h")
     if vol_accel >= VOL_ACCEL:
         score += 1
-        signals.append(f"⚡ Volume a acelerar ({vol_accel:.1f}x hora anterior)")
+        signals.append(f"⚡ Volume a acelerar ({vol_accel:.1f}x candle anterior)")
 
-    return score, signals, now
+    regime = get_regime()
+    reg_dir = regime["dir"]
+    aligned = (reg_dir == "BOTH") or (move_dir == reg_dir)
 
-# ── Loop principal ────────────────────────────────────────────────────────────
+    ts = datetime.now(timezone.utc).strftime("%H:%M")
+    reg_str = f"{reg_dir}" + (f"(ema ${regime['ema']:.5f})" if regime["ema"] else "")
+    print(f"[{ts}] DOGE ${cur['c']:.5f} | regime={reg_str} | "
+          f"vol_ratio={vol_ratio:.2f}x accel={vol_accel:.2f}x move={price_move*100:+.2f}% {move_dir} "
+          f"| score={score}/3", end="")
+
+    now = time.time()
+    if score >= MIN_SCORE and aligned and (now - _last_alert) > COOLDOWN:
+        emoji = "🟢" if move_dir == "UP" else "🔴"
+        msg = (
+            f"🚨 <b>DOGE — rompimento {emoji} {move_dir}</b>\n"
+            f"Preço: <b>${cur['c']:.5f}</b>\n"
+            f"Regime: <b>{reg_dir}</b> | Score: <b>{score}/3</b>\n\n"
+            + "\n".join(signals)
+        )
+        send_telegram(msg)
+        _last_alert = now
+        print(" → ALERTA ENVIADO")
+    elif score >= MIN_SCORE and not aligned:
+        print(f" → filtrado (movimento {move_dir} contra regime {reg_dir})")
+    else:
+        print("")
+
+# ─────────────────────────────────────────────
+#  LOOP
+# ─────────────────────────────────────────────
 def main():
-    global alert_cooldown
-
     print("=" * 55)
-    print("DOGE Pump Detector v2 — Lateral + Volume")
-    print(f"Intervalo: {CHECK_INTERVAL}s")
+    print(f"DOGE Pump Detector v4 — {INSTRUMENT} @ {TIMEFRAME} (Crypto.com)")
+    print(f"Bidirecional + filtro de regime | alerta ≥ {MIN_SCORE}/3")
     print("=" * 55)
 
-    send_telegram(
-        "🟢 <b>DOGE Pump Detector v2 iniciado</b>\n"
-        "Combina lateralização + aceleração de volume.\n"
-        f"Verificação a cada {CHECK_INTERVAL//60} minutos."
-    )
+    try:
+        reg = get_regime()
+        send_telegram(
+            "🟢 <b>DOGE Pump Detector v4 iniciado</b>\n"
+            f"{INSTRUMENT} @ {TIMEFRAME} — bidirecional, volume real por candle.\n"
+            f"Regime atual: <b>{reg['dir']}</b>\n"
+            f"Alerta quando score ≥ {MIN_SCORE}/3 na direção do regime."
+        )
+    except Exception as e:
+        print(f"[ERRO arranque] {e}")
 
     while True:
         try:
-            daily  = get_data(30, "daily")
-            hourly = get_data(2,  "hourly")
-
-            lateral_days, ref_price = check_lateral(daily)
-            vol_result = check_volume(hourly)
-
-            # check_volume pode devolver 2 ou 3 valores dependendo dos dados
-            if len(vol_result) == 3:
-                vol_score, vol_signals, now_candle = vol_result
-            else:
-                vol_score, vol_signals = vol_result
-                now_candle = hourly[-1] if hourly else None
-
-            price_now = now_candle["price"] if now_candle else 0.0
-            ts_now    = int(time.time())
-
-            in_lateral = lateral_days >= LATERAL_MIN_DAYS
-
-            print(
-                f"[{datetime.now(timezone.utc).strftime('%H:%M')}] "
-                f"DOGE ${price_now:.5f} | "
-                f"lateral={lateral_days}d | vol_score={vol_score}/3"
-            )
-
-            # Alerta principal: lateral + volume a acelerar
-            if in_lateral and vol_score >= 2 and ts_now > alert_cooldown:
-                msg = (
-                    f"🚨 <b>DOGE — Setup de Breakout Detetado</b>\n\n"
-                    f"💰 Preço atual: <b>${price_now:.5f}</b>\n"
-                    f"📐 Lateral há <b>{lateral_days} dias</b> em torno de ${ref_price:.5f}\n"
-                    f"🔥 Score de volume: <b>{vol_score}/3</b>\n\n"
-                    + "\n".join(vol_signals)
-                    + f"\n\n🕐 {now_candle['dt'].strftime('%Y-%m-%d %H:%M')} UTC\n"
-                    f"⚠️ Não é conselho financeiro."
-                )
-                send_telegram(msg)
-                alert_cooldown = ts_now + COOLDOWN_PERIOD
-                print(f"[ALERTA ENVIADO] lateral={lateral_days}d + vol_score={vol_score}/3")
-
-            # Alerta secundário: volume forte mesmo sem lateralização clara
-            elif not in_lateral and vol_score == 3 and ts_now > alert_cooldown:
-                msg = (
-                    f"⚡ <b>DOGE — Volume Extremo</b>\n\n"
-                    f"💰 Preço: <b>${price_now:.5f}</b>\n"
-                    f"Score: <b>3/3</b> (sem lateralização prévia)\n\n"
-                    + "\n".join(vol_signals)
-                    + f"\n\n🕐 {now_candle['dt'].strftime('%Y-%m-%d %H:%M')} UTC\n"
-                    f"⚠️ Não é conselho financeiro."
-                )
-                send_telegram(msg)
-                alert_cooldown = ts_now + COOLDOWN_PERIOD
-                print(f"[ALERTA SECUNDÁRIO] vol_score=3/3 sem lateral")
-
+            analyze(get_candles())
         except Exception as e:
             print(f"[ERRO] {e}")
-
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
